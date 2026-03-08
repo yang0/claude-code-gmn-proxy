@@ -1,0 +1,36 @@
+{
+  "name": "claude-code-gmn-proxy",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Run Claude Code against the model/provider already configured for Codex.",
+  "bin": {
+    "claude-codex": "./bin/claude-codex.mjs",
+    "cloud-code": "./bin/cloud-code.mjs",
+    "cloud-code-proxy-install-service": "./bin/cloud-code-proxy-install-service.mjs",
+    "cloud-code-proxy-status": "./bin/cloud-code-proxy-status.mjs",
+    "cloud-code-proxy-stop": "./bin/cloud-code-proxy-stop.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "proxy",
+    "anthropic",
+    "openai-responses"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yang0/claude-code-gmn-proxy.git"
+  },
+  "homepage": "https://github.com/yang0/claude-code-gmn-proxy",
+  "bugs": {
+    "url": "https://github.com/yang0/claude-code-gmn-proxy/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
