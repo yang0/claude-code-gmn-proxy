@@ -1,3 +1,5 @@
 node_modules/
 *.log
 .DS_Store
+# Managed by evolution bootstrap: local Git worktrees
+.worktrees/
