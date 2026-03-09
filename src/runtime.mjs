@@ -1,3 +1,4 @@
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -31,6 +32,52 @@ export function getConfig() {
   return config;
 }
 
+function isExecutable(filePath) {
+  try {
+    const stats = fsSync.statSync(filePath);
+    if (!stats.isFile()) {
+      return false;
+    }
+    if (process.platform === 'win32') {
+      return true;
+    }
+    fsSync.accessSync(filePath, fsSync.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function buildPathCandidates(command) {
+  if (process.platform !== 'win32') {
+    return [command];
+  }
+  if (path.extname(command)) {
+    return [command];
+  }
+  const extensions = (process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD')
+    .split(';')
+    .filter(Boolean);
+  return [command, ...extensions.map((extension) => `${command}${extension}`)];
+}
+
+function findBinaryOnPath(command) {
+  const rawPath = process.env.PATH || '';
+  for (const entry of rawPath.split(path.delimiter)) {
+    const dir = entry.replace(/^"(.*)"$/, '$1');
+    if (!dir) {
+      continue;
+    }
+    for (const candidate of buildPathCandidates(command)) {
+      const fullPath = path.join(dir, candidate);
+      if (isExecutable(fullPath)) {
+        return fullPath;
+      }
+    }
+  }
+  return null;
+}
+
 export async function proxyHealth(config = getConfig()) {
   try {
     const res = await fetch(`http://${config.host}:${config.port}/health`);
@@ -46,8 +93,7 @@ export function findClaudeBinary() {
   if (override) {
     return override;
   }
-  const out = spawnSync('bash', ['-lc', 'command -v claude'], { encoding: 'utf8' });
-  const bin = out.stdout.trim();
+  const bin = findBinaryOnPath('claude');
   if (!bin) {
     throw new Error('Claude Code CLI not found. Install it first with: npm install -g @anthropic-ai/claude-code');
   }
@@ -63,28 +109,32 @@ function resolvePidFile(customStateDir) {
 }
 
 function systemctlAvailable() {
-  return spawnSync('bash', ['-lc', 'command -v systemctl >/dev/null 2>&1']).status === 0;
+  return process.platform === 'linux' && Boolean(findBinaryOnPath('systemctl'));
 }
 
 async function startDetachedProxy(config) {
   await ensureStateDir();
   const out = await fs.open(logFile, 'a');
-  const child = spawn(getNodeBinary(), [path.join(packageRoot, 'src', 'server.mjs')], {
-    detached: true,
-    stdio: ['ignore', out.fd, out.fd],
-    env: {
-      ...process.env,
-      CLAUDE_CODE_GMN_PROXY_HOST: config.host,
-      CLAUDE_CODE_GMN_PROXY_PORT: String(config.port),
-      CLAUDE_CODE_GMN_PROXY_UPSTREAM_BASE_URL: config.upstreamBaseUrl,
-      CLAUDE_CODE_GMN_PROXY_UPSTREAM_API_KEY: config.upstreamApiKey,
-      CLAUDE_CODE_GMN_PROXY_MODEL: config.defaultModel,
-      CLAUDE_CODE_GMN_PROXY_REASONING: config.reasoningEffort,
-      CLAUDE_CODE_GMN_PROXY_AUTH_TOKEN: config.localAuthToken,
-    },
-  });
-  child.unref();
-  await fs.writeFile(pidFile, `${child.pid}\n`);
+  try {
+    const child = spawn(getNodeBinary(), [path.join(packageRoot, 'src', 'server.mjs')], {
+      detached: true,
+      stdio: ['ignore', out.fd, out.fd],
+      env: {
+        ...process.env,
+        CLAUDE_CODE_GMN_PROXY_HOST: config.host,
+        CLAUDE_CODE_GMN_PROXY_PORT: String(config.port),
+        CLAUDE_CODE_GMN_PROXY_UPSTREAM_BASE_URL: config.upstreamBaseUrl,
+        CLAUDE_CODE_GMN_PROXY_UPSTREAM_API_KEY: config.upstreamApiKey,
+        CLAUDE_CODE_GMN_PROXY_MODEL: config.defaultModel,
+        CLAUDE_CODE_GMN_PROXY_REASONING: config.reasoningEffort,
+        CLAUDE_CODE_GMN_PROXY_AUTH_TOKEN: config.localAuthToken,
+      },
+    });
+    child.unref();
+    await fs.writeFile(pidFile, `${child.pid}\n`);
+  } finally {
+    await out.close();
+  }
 }
 
 async function startViaSystemd() {

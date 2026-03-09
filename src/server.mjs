@@ -1,5 +1,7 @@
 import http from 'node:http';
+import path from 'node:path';
 import { URL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
 import {
   anthropicToResponsesRequest,
@@ -193,7 +195,7 @@ export async function startServer(overrides = {}) {
   return { server, config };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   const { config } = await startServer();
   process.stdout.write(`claude-code-gmn-proxy listening on http://${config.host}:${config.port}\n`);
 }

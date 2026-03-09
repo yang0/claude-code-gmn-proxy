@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import net from 'node:net';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createServer } from '../src/server.mjs';
 
 function startServer(options = {}) {
@@ -19,6 +22,14 @@ function startServer(options = {}) {
       resolve({ server, port: address.port });
     });
   });
+}
+
+async function getFreePort() {
+  const probe = net.createServer();
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const { port } = probe.address();
+  await new Promise((resolve, reject) => probe.close((error) => (error ? reject(error) : resolve())));
+  return port;
 }
 
 test('server exposes health endpoint and enforces auth on /v1/messages', async () => {
@@ -82,4 +93,49 @@ test('server proxies non-stream messages to upstream and returns Anthropics shap
     server.close();
     await once(server, 'close');
   }
+});
+
+test('server starts when executed directly via node', async (context) => {
+  const port = await getFreePort();
+  const entry = fileURLToPath(new URL('../src/server.mjs', import.meta.url));
+  const stdout = [];
+  const stderr = [];
+  const child = spawn(process.execPath, [entry], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CLAUDE_CODE_GMN_PROXY_HOST: '127.0.0.1',
+      CLAUDE_CODE_GMN_PROXY_PORT: String(port),
+      CLAUDE_CODE_GMN_PROXY_UPSTREAM_BASE_URL: 'https://example.invalid',
+      CLAUDE_CODE_GMN_PROXY_UPSTREAM_API_KEY: 'test-key',
+    },
+  });
+
+  child.stdout.on('data', (chunk) => stdout.push(chunk.toString()));
+  child.stderr.on('data', (chunk) => stderr.push(chunk.toString()));
+  context.after(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+    }
+  });
+
+  let health = null;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/health`);
+      if (response.ok) {
+        health = await response.json();
+        break;
+      }
+    } catch {
+      // child may still be booting
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  assert.ok(
+    health,
+    `Expected direct server execution to expose /health. exitCode=${child.exitCode} stdout=${stdout.join('')} stderr=${stderr.join('')}`,
+  );
+  assert.equal(health.ok, true);
 });
