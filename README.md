@@ -1,5 +1,7 @@
 # Claude Code GMN Proxy
 
+[中文说明](./README.zh-CN.md)
+
 Run Claude Code against the model/provider that is already configured for Codex.
 
 ## Goal
