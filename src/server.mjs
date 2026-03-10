@@ -3,6 +3,7 @@ import path from 'node:path';
 import { URL } from 'node:url';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
+import { configFingerprint } from './config-fingerprint.mjs';
 import {
   anthropicToResponsesRequest,
   openaiResponseToAnthropic,
@@ -137,6 +138,7 @@ export function createServer({ config = loadConfig(), upstreamFetch = fetch } = 
           ok: true,
           default_model: config.defaultModel,
           upstream_base_url: config.upstreamBaseUrl,
+          config_fingerprint: configFingerprint(config),
         });
       }
 

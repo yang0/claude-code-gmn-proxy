@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
+import { configFingerprint } from './config-fingerprint.mjs';
 import { SERVICE_NAME, serviceIsInstalled } from './systemd.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -88,6 +89,15 @@ export async function proxyHealth(config = getConfig()) {
   }
 }
 
+function proxyMatchesConfig(health, config) {
+  return Boolean(
+    health?.ok &&
+    health.default_model === config.defaultModel &&
+    health.upstream_base_url === config.upstreamBaseUrl &&
+    health.config_fingerprint === configFingerprint(config),
+  );
+}
+
 export function findClaudeBinary() {
   const override = process.env.CLAUDE_CODE_CLI;
   if (override) {
@@ -141,19 +151,54 @@ async function startViaSystemd() {
   spawnSync('systemctl', ['--user', 'start', SERVICE_NAME], { stdio: 'ignore' });
 }
 
+async function restartViaSystemd() {
+  spawnSync('systemctl', ['--user', 'restart', SERVICE_NAME], { stdio: 'ignore' });
+}
+
+async function waitForProxyShutdown(config, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!await proxyHealth(config)) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
 export async function ensureProxyAvailable(config = getConfig()) {
-  if (await proxyHealth(config)) {
+  const health = await proxyHealth(config);
+  if (proxyMatchesConfig(health, config)) {
     return config;
   }
 
-  if (systemctlAvailable() && serviceIsInstalled()) {
-    await startViaSystemd();
+  const useSystemd = systemctlAvailable() && serviceIsInstalled();
+  if (health) {
+    if (useSystemd) {
+      if (await detachedProxyPidLooksOwnedByCurrentPackage()) {
+        await stopDetachedProxyOnly();
+        if (!await waitForProxyShutdown(config)) {
+          throw new Error(`Existing detached proxy on http://${config.host}:${config.port} did not stop before restarting systemd service`);
+        }
+      }
+      await restartViaSystemd();
+    } else {
+      await stopDetachedProxyOnly();
+      if (!await waitForProxyShutdown(config)) {
+        throw new Error(`Existing proxy on http://${config.host}:${config.port} did not stop after configuration drift`);
+      }
+      await startDetachedProxy(config);
+    }
   } else {
-    await startDetachedProxy(config);
+    if (useSystemd) {
+      await startViaSystemd();
+    } else {
+      await startDetachedProxy(config);
+    }
   }
 
   for (let i = 0; i < 40; i += 1) {
-    if (await proxyHealth(config)) {
+    if (proxyMatchesConfig(await proxyHealth(config), config)) {
       return config;
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -174,26 +219,96 @@ export async function stopDetachedProxyOnly({ stateDir: customStateDir } = {}) {
   await fs.rm(customPidFile, { force: true });
 }
 
+export async function detachedProxyPidLooksOwnedByCurrentPackage({ stateDir: customStateDir } = {}) {
+  if (process.platform !== 'linux') {
+    return false;
+  }
+
+  const customPidFile = resolvePidFile(customStateDir);
+  try {
+    const pid = Number((await fs.readFile(customPidFile, 'utf8')).trim());
+    if (!Number.isFinite(pid) || pid <= 0) {
+      return false;
+    }
+    const cmdline = await fs.readFile(`/proc/${pid}/cmdline`, 'utf8');
+    return cmdline.includes(path.join(packageRoot, 'src', 'server.mjs'));
+  } catch {
+    return false;
+  }
+}
+
 function hasModelArg(argv) {
   return argv.some((arg, index) => arg === '--model' || (index > 0 && argv[index - 1] === '--model') || arg.startsWith('--model='));
+}
+
+export function buildClaudeSettingsOverride(config) {
+  return {
+    env: {
+      ANTHROPIC_BASE_URL: `http://${config.host}:${config.port}`,
+      ANTHROPIC_AUTH_TOKEN: config.localAuthToken,
+      ANTHROPIC_API_KEY: config.localAuthToken,
+    },
+  };
+}
+
+function stripConflictingClaudeArgs(argv) {
+  const stripped = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--settings' || arg === '--setting-sources') {
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--settings=') || arg.startsWith('--setting-sources=')) {
+      continue;
+    }
+    stripped.push(arg);
+  }
+  return stripped;
+}
+
+export function buildClaudeArgs(argv, config, settingsPath) {
+  const cleanArgv = stripConflictingClaudeArgs(argv);
+  const modelArgs = hasModelArg(cleanArgv) ? cleanArgv : ['--model', config.defaultModel, ...cleanArgv];
+  return ['--settings', settingsPath, ...modelArgs];
+}
+
+function shouldUseShellForCommand(command) {
+  return process.platform === 'win32' && ['.cmd', '.bat'].includes(path.extname(command).toLowerCase());
 }
 
 export async function execClaudeWithProxy(argv) {
   const config = await ensureProxyAvailable();
   const claude = findClaudeBinary();
-  const args = hasModelArg(argv) ? argv : ['--model', config.defaultModel, ...argv];
+  await ensureStateDir();
+  const settingsPath = path.join(stateDir, `claude-settings-${process.pid}-${Date.now()}.json`);
+  await fs.writeFile(settingsPath, `${JSON.stringify(buildClaudeSettingsOverride(config))}\n`);
+  const args = buildClaudeArgs(argv, config, settingsPath);
+  const cleanupSettingsFile = () => {
+    try {
+      fsSync.rmSync(settingsPath, { force: true });
+    } catch {
+      // ignore cleanup failures for temp settings
+    }
+  };
   const child = spawn(claude, args, {
+    shell: shouldUseShellForCommand(claude),
     stdio: 'inherit',
     env: {
       ...process.env,
       ANTHROPIC_BASE_URL: `http://${config.host}:${config.port}`,
       ANTHROPIC_AUTH_TOKEN: config.localAuthToken,
+      ANTHROPIC_API_KEY: config.localAuthToken,
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || '1',
     },
   });
   await new Promise((resolve, reject) => {
-    child.on('error', reject);
+    child.on('error', (error) => {
+      cleanupSettingsFile();
+      reject(error);
+    });
     child.on('exit', (code, signal) => {
+      cleanupSettingsFile();
       if (signal) {
         process.kill(process.pid, signal);
         return;
