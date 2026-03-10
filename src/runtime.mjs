@@ -122,6 +122,40 @@ function systemctlAvailable() {
   return process.platform === 'linux' && Boolean(findBinaryOnPath('systemctl'));
 }
 
+function readCommandLineForPid(pid) {
+  if (process.platform === 'linux') {
+    return fs.readFile(`/proc/${pid}/cmdline`, 'utf8');
+  }
+
+  if (process.platform === 'win32') {
+    const shell = findBinaryOnPath('pwsh') || findBinaryOnPath('powershell');
+    if (!shell) {
+      return Promise.resolve(null);
+    }
+    const result = spawnSync(shell, [
+      '-NoProfile',
+      '-Command',
+      `$process = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; if ($process) { $process.CommandLine }`,
+    ], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (result.status !== 0) {
+      return Promise.resolve(null);
+    }
+    return Promise.resolve(result.stdout.trim() || null);
+  }
+
+  const result = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  if (result.status !== 0) {
+    return Promise.resolve(null);
+  }
+  return Promise.resolve(result.stdout.trim() || null);
+}
+
 async function startDetachedProxy(config) {
   await ensureStateDir();
   const out = await fs.open(logFile, 'a');
@@ -183,6 +217,9 @@ export async function ensureProxyAvailable(config = getConfig()) {
       }
       await restartViaSystemd();
     } else {
+      if (!await detachedProxyPidLooksOwnedByCurrentPackage()) {
+        throw new Error(`Existing proxy on http://${config.host}:${config.port} is not owned by this package and cannot be restarted automatically`);
+      }
       await stopDetachedProxyOnly();
       if (!await waitForProxyShutdown(config)) {
         throw new Error(`Existing proxy on http://${config.host}:${config.port} did not stop after configuration drift`);
@@ -220,18 +257,14 @@ export async function stopDetachedProxyOnly({ stateDir: customStateDir } = {}) {
 }
 
 export async function detachedProxyPidLooksOwnedByCurrentPackage({ stateDir: customStateDir } = {}) {
-  if (process.platform !== 'linux') {
-    return false;
-  }
-
   const customPidFile = resolvePidFile(customStateDir);
   try {
     const pid = Number((await fs.readFile(customPidFile, 'utf8')).trim());
     if (!Number.isFinite(pid) || pid <= 0) {
       return false;
     }
-    const cmdline = await fs.readFile(`/proc/${pid}/cmdline`, 'utf8');
-    return cmdline.includes(path.join(packageRoot, 'src', 'server.mjs'));
+    const cmdline = await readCommandLineForPid(pid);
+    return Boolean(cmdline && cmdline.includes(path.join(packageRoot, 'src', 'server.mjs')));
   } catch {
     return false;
   }
@@ -277,6 +310,14 @@ function shouldUseShellForCommand(command) {
   return process.platform === 'win32' && ['.cmd', '.bat'].includes(path.extname(command).toLowerCase());
 }
 
+function exitCodeForSignal(signal) {
+  return {
+    SIGHUP: 129,
+    SIGINT: 130,
+    SIGTERM: 143,
+  }[signal] || 1;
+}
+
 export async function execClaudeWithProxy(argv) {
   const config = await ensureProxyAvailable();
   const claude = findClaudeBinary();
@@ -284,6 +325,7 @@ export async function execClaudeWithProxy(argv) {
   const settingsPath = path.join(stateDir, `claude-settings-${process.pid}-${Date.now()}.json`);
   await fs.writeFile(settingsPath, `${JSON.stringify(buildClaudeSettingsOverride(config))}\n`);
   const args = buildClaudeArgs(argv, config, settingsPath);
+  let forwardedSignal = null;
   const cleanupSettingsFile = () => {
     try {
       fsSync.rmSync(settingsPath, { force: true });
@@ -302,15 +344,43 @@ export async function execClaudeWithProxy(argv) {
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || '1',
     },
   });
+  const signalHandlers = new Map();
+  const disposeCleanupHooks = () => {
+    process.off('exit', cleanupSettingsFile);
+    for (const [signal, handler] of signalHandlers) {
+      process.off(signal, handler);
+    }
+    signalHandlers.clear();
+  };
+  const forwardSignalToChild = (signal) => {
+    forwardedSignal = signal;
+    cleanupSettingsFile();
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill(signal);
+      } catch {
+        // child may already be gone
+      }
+    }
+  };
+  process.on('exit', cleanupSettingsFile);
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    const handler = () => forwardSignalToChild(signal);
+    signalHandlers.set(signal, handler);
+    process.once(signal, handler);
+  }
   await new Promise((resolve, reject) => {
     child.on('error', (error) => {
+      disposeCleanupHooks();
       cleanupSettingsFile();
       reject(error);
     });
     child.on('exit', (code, signal) => {
+      disposeCleanupHooks();
       cleanupSettingsFile();
-      if (signal) {
-        process.kill(process.pid, signal);
+      const exitSignal = signal || forwardedSignal;
+      if (exitSignal) {
+        process.exit(exitCodeForSignal(exitSignal));
         return;
       }
       process.exit(code ?? 0);

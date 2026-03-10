@@ -110,9 +110,7 @@ test('buildClaudeArgs removes caller-provided Claude settings flags', () => {
   ]);
 });
 
-test('detachedProxyPidLooksOwnedByCurrentPackage only trusts this repo server process on Linux', {
-  skip: process.platform !== 'linux',
-}, async (context) => {
+test('detachedProxyPidLooksOwnedByCurrentPackage only trusts this repo server process', async (context) => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-code-gmn-proxy-owned-'));
   const port = await getFreePort();
   const entry = fileURLToPath(new URL('../src/server.mjs', import.meta.url));
@@ -322,6 +320,42 @@ function startStaleProxy({ port, health, shutdownDelayMs = 0 }) {
   return child;
 }
 
+function startOwnedDetachedProxy({ config, shutdownDelayMs = 0 }) {
+  const entry = fileURLToPath(new URL('../src/server.mjs', import.meta.url));
+  const child = spawn(process.execPath, ['--input-type=module', '-', entry], {
+    stdio: ['pipe', 'ignore', 'pipe'],
+    env: {
+      ...process.env,
+      ENTRY: entry,
+      SHUTDOWN_DELAY_MS: String(shutdownDelayMs),
+      CLAUDE_CODE_GMN_PROXY_HOST: config.host,
+      CLAUDE_CODE_GMN_PROXY_PORT: String(config.port),
+      CLAUDE_CODE_GMN_PROXY_UPSTREAM_BASE_URL: config.upstreamBaseUrl,
+      CLAUDE_CODE_GMN_PROXY_UPSTREAM_API_KEY: config.upstreamApiKey,
+      CLAUDE_CODE_GMN_PROXY_MODEL: config.defaultModel,
+      CLAUDE_CODE_GMN_PROXY_REASONING: config.reasoningEffort,
+      CLAUDE_CODE_GMN_PROXY_AUTH_TOKEN: config.localAuthToken,
+    },
+  });
+  child.stdin.end(`
+    import { spawn } from 'node:child_process';
+    const server = spawn(process.execPath, [process.env.ENTRY], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      env: process.env,
+    });
+    process.on('SIGTERM', () => {
+      setTimeout(() => {
+        if (server.exitCode === null && server.signalCode === null) {
+          server.kill('SIGTERM');
+        }
+        process.exit(0);
+      }, Number(process.env.SHUTDOWN_DELAY_MS || '0'));
+    });
+    setInterval(() => {}, 1000);
+  `);
+  return child;
+}
+
 async function runEnsureProxyAvailable({ tempHome, runtimeModule, config }) {
   const stdout = [];
   const stderr = [];
@@ -396,9 +430,16 @@ test('ensureProxyAvailable does not reuse a detached proxy with stale config', a
   const stateDir = path.join(tempHome, '.claude-code-gmn-proxy');
   await fs.mkdir(stateDir, { recursive: true });
 
-  const staleProxy = startStaleProxy({
-    port,
-    health: { ok: true, default_model: 'old-model', upstream_base_url: 'https://old.example' },
+  const staleProxy = startOwnedDetachedProxy({
+    config: {
+      host: '127.0.0.1',
+      port,
+      upstreamBaseUrl: 'https://old.example',
+      upstreamApiKey: 'stale-key',
+      defaultModel: 'old-model',
+      reasoningEffort: 'high',
+      localAuthToken: 'local-token',
+    },
   });
   const staleStderr = [];
   staleProxy.stderr.on('data', (chunk) => staleStderr.push(chunk.toString()));
@@ -438,9 +479,16 @@ test('ensureProxyAvailable waits for a stale detached proxy to release the port'
   const stateDir = path.join(tempHome, '.claude-code-gmn-proxy');
   await fs.mkdir(stateDir, { recursive: true });
 
-  const staleProxy = startStaleProxy({
-    port,
-    health: { ok: true, default_model: 'old-model', upstream_base_url: 'https://old.example' },
+  const staleProxy = startOwnedDetachedProxy({
+    config: {
+      host: '127.0.0.1',
+      port,
+      upstreamBaseUrl: 'https://old.example',
+      upstreamApiKey: 'stale-key',
+      defaultModel: 'old-model',
+      reasoningEffort: 'high',
+      localAuthToken: 'local-token',
+    },
     shutdownDelayMs: 400,
   });
   const staleStderr = [];
@@ -488,16 +536,10 @@ test('ensureProxyAvailable does not reuse a proxy when the config fingerprint ch
   };
   await fs.mkdir(stateDir, { recursive: true });
 
-  const staleProxy = startStaleProxy({
-    port,
-    health: {
-      ok: true,
-      default_model: config.defaultModel,
-      upstream_base_url: config.upstreamBaseUrl,
-      config_fingerprint: configFingerprint({
-        ...config,
-        upstreamApiKey: 'old-key',
-      }),
+  const staleProxy = startOwnedDetachedProxy({
+    config: {
+      ...config,
+      upstreamApiKey: 'old-key',
     },
   });
   const staleStderr = [];
@@ -516,3 +558,200 @@ test('ensureProxyAvailable does not reuse a proxy when the config fingerprint ch
   assert.equal(result.code, 0, `${result.stderr}${staleStderr.join('')}`);
   assert.match(result.stdout, new RegExp(`"config_fingerprint":"${configFingerprint(config)}"`));
 });
+
+test('ensureProxyAvailable refuses to kill an unrelated pid during stale-config recovery', async (context) => {
+  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-code-gmn-proxy-home-'));
+  const port = await getFreePort();
+  const runtimeModule = new URL('../src/runtime.mjs', import.meta.url).href;
+
+  const staleProxy = startStaleProxy({
+    port,
+    health: { ok: true, default_model: 'old-model', upstream_base_url: 'https://old.example' },
+  });
+  context.after(() => {
+    if (staleProxy.exitCode === null && staleProxy.signalCode === null) {
+      staleProxy.kill('SIGTERM');
+    }
+  });
+
+  await waitForHealth(port);
+
+  const stdout = [];
+  const stderr = [];
+  const child = spawn(process.execPath, ['--input-type=module', '-'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      HOME: tempHome,
+      USERPROFILE: tempHome,
+    },
+  });
+  child.stdout.on('data', (chunk) => stdout.push(chunk.toString()));
+  child.stderr.on('data', (chunk) => stderr.push(chunk.toString()));
+  child.stdin.end(`
+    import { promises as fs } from 'node:fs';
+    import os from 'node:os';
+    import path from 'node:path';
+    import { ensureProxyAvailable } from ${JSON.stringify(runtimeModule)};
+    const config = {
+      host: '127.0.0.1',
+      port: ${port},
+      upstreamBaseUrl: 'https://example.invalid',
+      upstreamApiKey: 'test-key',
+      defaultModel: 'gpt-5.4',
+      reasoningEffort: 'high',
+      localAuthToken: 'local-token',
+    };
+    const stateDir = path.join(os.homedir(), '.claude-code-gmn-proxy');
+    await fs.mkdir(stateDir, { recursive: true });
+    await fs.writeFile(path.join(stateDir, 'proxy.pid'), \`\${process.pid}\\n\`);
+    try {
+      await ensureProxyAvailable(config);
+      console.log('unexpected-success');
+      process.exit(0);
+    } catch (error) {
+      console.error(error.message || String(error));
+      process.exit(1);
+    }
+  `);
+
+  const [code, signal] = await once(child, 'exit');
+  assert.equal(signal, null, `unexpected signal ${signal}; stdout=${stdout.join('')} stderr=${stderr.join('')}`);
+  assert.equal(code, 1, `stdout=${stdout.join('')} stderr=${stderr.join('')}`);
+  assert.match(stderr.join(''), /not owned by this package/i);
+});
+
+test('execClaudeWithProxy removes temp settings files when the wrapper receives SIGINT', {
+  skip: process.platform !== 'win32',
+}, async (context) => {
+  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-code-gmn-proxy-home-'));
+  const tempBin = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-code-gmn-proxy-bin-'));
+  const fakeClaudeScript = path.join(tempBin, 'fake-claude-sleep.mjs');
+  const fakeClaudeCmd = path.join(tempBin, 'claude.cmd');
+  const reportPath = path.join(tempHome, 'fake-claude-sleep-report.json');
+  const runtimeModule = new URL('../src/runtime.mjs', import.meta.url).href;
+  const port = await getFreePort();
+  const config = {
+    host: '127.0.0.1',
+    port,
+    upstreamBaseUrl: 'https://example.invalid',
+    upstreamApiKey: 'test-key',
+    defaultModel: 'gpt-5.4',
+    reasoningEffort: 'high',
+    localAuthToken: 'local-token',
+  };
+  const healthPayload = {
+    ok: true,
+    default_model: config.defaultModel,
+    upstream_base_url: config.upstreamBaseUrl,
+    config_fingerprint: configFingerprint(config),
+  };
+
+  await fs.writeFile(fakeClaudeScript, `
+    import fs from 'node:fs';
+    fs.writeFileSync(process.env.REPORT_PATH, JSON.stringify({ pid: process.pid, args: process.argv.slice(2) }));
+    process.on('SIGINT', () => process.exit(0));
+    process.on('SIGTERM', () => process.exit(0));
+    setInterval(() => {}, 1000);
+  `);
+  await fs.writeFile(fakeClaudeCmd, `@echo off\r\nnode \"${fakeClaudeScript}\" %*\r\n`);
+
+  const proxy = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/health') {
+      const body = JSON.stringify(healthPayload);
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      });
+      res.end(body);
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  await new Promise((resolve) => proxy.listen(port, '127.0.0.1', resolve));
+  context.after(async () => {
+    await new Promise((resolve, reject) => proxy.close((error) => (error ? reject(error) : resolve())));
+  });
+
+  const child = spawn(process.execPath, ['--input-type=module', '-'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      HOME: tempHome,
+      USERPROFILE: tempHome,
+      PATH: `${tempBin};${process.env.PATH || ''}`,
+      CLAUDE_CODE_CLI: 'claude.cmd',
+      REPORT_PATH: reportPath,
+      CLAUDE_CODE_GMN_PROXY_HOST: config.host,
+      CLAUDE_CODE_GMN_PROXY_PORT: String(config.port),
+      CLAUDE_CODE_GMN_PROXY_UPSTREAM_BASE_URL: config.upstreamBaseUrl,
+      CLAUDE_CODE_GMN_PROXY_UPSTREAM_API_KEY: config.upstreamApiKey,
+      CLAUDE_CODE_GMN_PROXY_MODEL: config.defaultModel,
+      CLAUDE_CODE_GMN_PROXY_REASONING: config.reasoningEffort,
+      CLAUDE_CODE_GMN_PROXY_AUTH_TOKEN: config.localAuthToken,
+    },
+  });
+  const stderr = [];
+  child.stderr.on('data', (chunk) => stderr.push(chunk.toString()));
+  child.stdin.end(`
+    import { execClaudeWithProxy } from ${JSON.stringify(runtimeModule)};
+    setTimeout(() => {
+      process.emit('SIGINT', 'SIGINT');
+    }, 250);
+    setTimeout(() => {
+      process.exit(99);
+    }, 2000);
+    await execClaudeWithProxy(['-p', 'Reply with PONG only.', '--output-format', 'json']);
+  `);
+
+  const stateDir = path.join(tempHome, '.claude-code-gmn-proxy');
+  await waitForCondition(async () => {
+    try {
+      const stateFiles = await fs.readdir(stateDir);
+      return stateFiles.some((name) => name.startsWith('claude-settings-'));
+    } catch {
+      return false;
+    }
+  }, 'wrapper temp settings file');
+  await waitForCondition(async () => {
+    try {
+      await fs.access(reportPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }, 'fake Claude startup report');
+
+  await once(child, 'exit');
+
+  const report = JSON.parse(await fs.readFile(reportPath, 'utf8'));
+  try {
+    process.kill(report.pid, 'SIGTERM');
+  } catch {
+    // child process may already have exited
+  }
+
+  await waitForCondition(async () => {
+    try {
+      const stateFiles = await fs.readdir(stateDir);
+      return stateFiles.filter((name) => name.startsWith('claude-settings-')).length === 0;
+    } catch {
+      return false;
+    }
+  }, 'wrapper temp settings cleanup');
+
+  const stateFiles = await fs.readdir(stateDir);
+  assert.deepEqual(stateFiles.filter((name) => name.startsWith('claude-settings-')), [], stderr.join(''));
+});
+
+async function waitForCondition(fn, description, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await fn()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for ${description}`);
+}
