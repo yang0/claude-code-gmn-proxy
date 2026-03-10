@@ -68,7 +68,6 @@ test('buildClaudeSettingsOverride routes Claude through the local proxy', () => 
     env: {
       ANTHROPIC_BASE_URL: 'http://127.0.0.1:4040',
       ANTHROPIC_AUTH_TOKEN: 'local-token',
-      ANTHROPIC_API_KEY: 'local-token',
     },
   });
 });
@@ -182,7 +181,16 @@ test('execClaudeWithProxy injects Claude settings and removes the temp settings 
     const settingsIndex = args.indexOf('--settings');
     const settingsPath = settingsIndex >= 0 ? args[settingsIndex + 1] : null;
     const settings = settingsPath ? JSON.parse(fs.readFileSync(settingsPath, 'utf8')) : null;
-    fs.writeFileSync(process.env.REPORT_PATH, JSON.stringify({ args, settings, settingsPath }, null, 2));
+    fs.writeFileSync(process.env.REPORT_PATH, JSON.stringify({
+      args,
+      settings,
+      settingsPath,
+      env: {
+        ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL ?? null,
+        ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN ?? null,
+        ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? null,
+      },
+    }, null, 2));
   `);
   await fs.writeFile(fakeClaudeCmd, `@echo off\r\nnode \"${fakeClaudeScript}\" %*\r\n`);
 
@@ -243,8 +251,12 @@ test('execClaudeWithProxy injects Claude settings and removes the temp settings 
     env: {
       ANTHROPIC_BASE_URL: `http://${config.host}:${config.port}`,
       ANTHROPIC_AUTH_TOKEN: config.localAuthToken,
-      ANTHROPIC_API_KEY: config.localAuthToken,
     },
+  });
+  assert.deepEqual(report.env, {
+    ANTHROPIC_BASE_URL: `http://${config.host}:${config.port}`,
+    ANTHROPIC_AUTH_TOKEN: config.localAuthToken,
+    ANTHROPIC_API_KEY: null,
   });
 
   const stateDir = path.join(tempHome, '.claude-code-gmn-proxy');

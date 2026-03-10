@@ -279,7 +279,6 @@ export function buildClaudeSettingsOverride(config) {
     env: {
       ANTHROPIC_BASE_URL: `http://${config.host}:${config.port}`,
       ANTHROPIC_AUTH_TOKEN: config.localAuthToken,
-      ANTHROPIC_API_KEY: config.localAuthToken,
     },
   };
 }
@@ -326,6 +325,13 @@ export async function execClaudeWithProxy(argv) {
   await fs.writeFile(settingsPath, `${JSON.stringify(buildClaudeSettingsOverride(config))}\n`);
   const args = buildClaudeArgs(argv, config, settingsPath);
   let forwardedSignal = null;
+  const claudeEnv = {
+    ...process.env,
+    ANTHROPIC_BASE_URL: `http://${config.host}:${config.port}`,
+    ANTHROPIC_AUTH_TOKEN: config.localAuthToken,
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || '1',
+  };
+  delete claudeEnv.ANTHROPIC_API_KEY;
   const cleanupSettingsFile = () => {
     try {
       fsSync.rmSync(settingsPath, { force: true });
@@ -336,13 +342,7 @@ export async function execClaudeWithProxy(argv) {
   const child = spawn(claude, args, {
     shell: shouldUseShellForCommand(claude),
     stdio: 'inherit',
-    env: {
-      ...process.env,
-      ANTHROPIC_BASE_URL: `http://${config.host}:${config.port}`,
-      ANTHROPIC_AUTH_TOKEN: config.localAuthToken,
-      ANTHROPIC_API_KEY: config.localAuthToken,
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || '1',
-    },
+    env: claudeEnv,
   });
   const signalHandlers = new Map();
   const disposeCleanupHooks = () => {
